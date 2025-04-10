@@ -45,10 +45,10 @@ async def load_player_state(telegram_id: int) -> Optional[PlayerState]:
         return None
 
     try:
-        # Используем скобки для группировки цепочки вызовов
+        # Загружаем обновленный набор колонок
         query = (
             supabase.table("players")
-            .select("telegram_id", "state", "current_event_class_name")
+            .select("telegram_id", "state", "current_event_id")
             .eq("telegram_id", telegram_id)
             .limit(1)
         )
@@ -64,11 +64,11 @@ async def load_player_state(telegram_id: int) -> Optional[PlayerState]:
         full_player_data = {
             "telegram_id": player_data_raw.get("telegram_id"),
             "country_state": player_data_raw.get("state"),
-            "current_event_class_name": player_data_raw.get("current_event_class_name")
+            "current_event_id": player_data_raw.get("current_event_id")
         }
         try:
             player_state = PlayerState.model_validate(full_player_data)
-            logging.info(f"Loaded state for player {telegram_id} (event: {player_state.current_event_class_name}).")
+            logging.info(f"Loaded state for player {telegram_id} (event_id: {player_state.current_event_id}).")
             return player_state
         except ValidationError as e:
             logging.error(f"Data validation error for player {telegram_id}: {e}")
@@ -95,14 +95,13 @@ async def save_player_state(player_state: PlayerState) -> bool:
         return False
 
     try:
-        # Сохраняем все поля PlayerState в нужные колонки
+        # Сохраняем обновленный набор полей
         data_to_upsert = {
             "telegram_id": player_state.telegram_id,
-            "state": player_state.country_state.model_dump(), # Состояние страны в JSONB
-            "current_event_class_name": player_state.current_event_class_name # Имя класса события
+            "state": player_state.country_state.model_dump(),
+            "current_event_id": player_state.current_event_id
         }
         
-        # Используем скобки для группировки цепочки вызовов
         query = (
             supabase.table("players")
             .upsert(data_to_upsert)
@@ -112,7 +111,7 @@ async def save_player_state(player_state: PlayerState) -> bool:
 
         # Проверяем успешность операции (хотя upsert обычно не возвращает ошибку, если PK есть)
         if response.data or (hasattr(response, 'error') and response.error is None):
-            logging.info(f"Successfully saved state for player {player_state.telegram_id} (event: {player_state.current_event_class_name}).")
+            logging.info(f"Successfully saved state for player {player_state.telegram_id} (event_id: {player_state.current_event_id}).")
             return True
         else:
             logging.error(f"Failed to save player state for {player_state.telegram_id}. Response: {response}")

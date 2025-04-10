@@ -26,8 +26,8 @@ class PlayerState(BaseModel):
     telegram_id: int = Field(..., gt=0)
     # В Supabase можно хранить состояние страны как JSONB поле
     country_state: CountryState
-    # Добавляем поле для хранения имени класса текущего активного события
-    current_event_class_name: Optional[str] = None
+    # Изменяем поле: храним ID текущего события из таблицы events
+    current_event_id: Optional[int] = None
     # Можно добавить другие поля, например, время последнего обновления
     # last_updated: datetime = Field(default_factory=datetime.utcnow)
 
