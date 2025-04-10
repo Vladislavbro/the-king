@@ -126,3 +126,6 @@ dmypy.json
 
 # cursor
 .cursor/
+
+# Documentation / Guides (if not intended for repo)
+events_guide.md
