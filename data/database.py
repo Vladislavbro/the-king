@@ -1,0 +1,123 @@
+import logging
+from typing import Optional
+
+# Импортируем асинхронные Client и create_client из _async
+from supabase._async.client import AsyncClient, create_client
+from pydantic import ValidationError
+
+import config
+from .models import PlayerState, CountryState
+
+# Инициализация клиента Supabase
+supabase: Optional[AsyncClient] = None # Теперь используем AsyncClient
+
+# Функция инициализации теперь асинхронная
+async def init_supabase_client():
+    """Асинхронно инициализирует асинхронный клиент Supabase, используя SERVICE_ROLE ключ."""
+    global supabase
+    if not config.SUPABASE_URL or config.SUPABASE_URL == "YOUR_SUPABASE_URL_HERE":
+        logging.warning("Supabase URL не настроен. Работа с БД будет невозможна.")
+        return
+    # Проверяем наличие SERVICE_ROLE ключа
+    if not config.SUPABASE_SERVICE_ROLE_KEY or config.SUPABASE_SERVICE_ROLE_KEY == "YOUR_SUPABASE_SERVICE_KEY_HERE":
+        logging.warning("Supabase SERVICE_ROLE Key не настроен. Работа с БД будет невозможна.")
+        return
+
+    try:
+        # Используем await для асинхронного создания клиента
+        supabase = await create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+        logging.info("Supabase async client initialized successfully using SERVICE_ROLE key.")
+    except Exception as e:
+        logging.exception(f"Failed to initialize Supabase client: {e}")
+        supabase = None
+
+async def load_player_state(telegram_id: int) -> Optional[PlayerState]:
+    """Загружает состояние игрока из Supabase по его telegram_id.
+
+    Args:
+        telegram_id: ID игрока в Telegram.
+
+    Returns:
+        Объект PlayerState если игрок найден и данные валидны, иначе None.
+    """
+    if not supabase:
+        logging.error("Supabase client not initialized. Cannot load player state.")
+        return None
+
+    try:
+        # Используем скобки для группировки цепочки вызовов
+        query = (
+            supabase.table("players")
+            .select("telegram_id", "state", "current_event_class_name")
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+        )
+        response = await query.execute()
+        logging.debug(f"Supabase load response for {telegram_id}: {response}")
+
+        if not response.data:
+            logging.info(f"No existing state found for player {telegram_id}.")
+            return None # Игрок не найден
+
+        # Если данные есть:
+        player_data_raw = response.data[0]
+        full_player_data = {
+            "telegram_id": player_data_raw.get("telegram_id"),
+            "country_state": player_data_raw.get("state"),
+            "current_event_class_name": player_data_raw.get("current_event_class_name")
+        }
+        try:
+            player_state = PlayerState.model_validate(full_player_data)
+            logging.info(f"Loaded state for player {telegram_id} (event: {player_state.current_event_class_name}).")
+            return player_state
+        except ValidationError as e:
+            logging.error(f"Data validation error for player {telegram_id}: {e}")
+            return None # Данные в БД некорректны
+
+    except Exception as e:
+        logging.exception(f"Error loading player state for {telegram_id} from Supabase: {e}")
+        return None
+
+async def save_player_state(player_state: PlayerState) -> bool:
+    """Сохраняет или обновляет состояние игрока в Supabase.
+
+    Использует upsert: если запись с таким telegram_id существует, она обновляется,
+    иначе создается новая.
+
+    Args:
+        player_state: Pydantic модель с данными игрока.
+
+    Returns:
+        True если сохранение прошло успешно, иначе False.
+    """
+    if not supabase:
+        logging.error("Supabase client not initialized. Cannot save player state.")
+        return False
+
+    try:
+        # Сохраняем все поля PlayerState в нужные колонки
+        data_to_upsert = {
+            "telegram_id": player_state.telegram_id,
+            "state": player_state.country_state.model_dump(), # Состояние страны в JSONB
+            "current_event_class_name": player_state.current_event_class_name # Имя класса события
+        }
+        
+        # Используем скобки для группировки цепочки вызовов
+        query = (
+            supabase.table("players")
+            .upsert(data_to_upsert)
+        )
+        response = await query.execute()
+        logging.debug(f"Supabase save response for {player_state.telegram_id}: {response}")
+
+        # Проверяем успешность операции (хотя upsert обычно не возвращает ошибку, если PK есть)
+        if response.data or (hasattr(response, 'error') and response.error is None):
+            logging.info(f"Successfully saved state for player {player_state.telegram_id} (event: {player_state.current_event_class_name}).")
+            return True
+        else:
+            logging.error(f"Failed to save player state for {player_state.telegram_id}. Response: {response}")
+            return False
+
+    except Exception as e:
+        logging.exception(f"Error saving player state for {player_state.telegram_id} to Supabase: {e}")
+        return False
