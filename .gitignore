@@ -123,3 +123,6 @@ dmypy.json
 
 # Config secrets
 .env 
+
+# cursor
+.cursor/
