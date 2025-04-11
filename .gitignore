@@ -129,3 +129,6 @@ dmypy.json
 
 # Documentation / Guides (if not intended for repo)
 events_guide.md
+
+# Architecture
+architecture.md
