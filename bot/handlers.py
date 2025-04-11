@@ -1,8 +1,8 @@
 import logging
 import random # Потребуется для поиска события по имени класса
-from typing import Dict, Optional, Type
+from typing import Dict, Optional, Type, Any, List
 
-from aiogram import Router, F, types
+from aiogram import Router, F, types, Bot
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
@@ -10,8 +10,9 @@ from aiogram.exceptions import TelegramBadRequest
 from game.core import Player, Country # Импортируем Country для создания нового состояния
 from game.events import get_next_event, EventData, fetch_event_options # Импортируем EventData и fetch_event_options
 from game.mechanics import check_game_over_conditions
-from data.database import load_player_state, save_player_state
+from data.database import supabase, load_player_state, save_player_state
 from data.models import PlayerState, CountryState # Импортируем Pydantic модели
+import config
 
 # Используем Router для лучшей организации
 router = Router()
@@ -29,12 +30,12 @@ def build_event_keyboard(event_data: EventData) -> types.InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
-async def send_event_to_player(message_or_callback: types.Message | types.CallbackQuery, player: Player, event_data: EventData):
-    """Отправляет или редактирует сообщение с новым событием и текущим статусом.
-       Сохраняет состояние игрока с ID нового события в БД.
+async def send_event_to_player(message_or_callback: types.Message | types.CallbackQuery, player: Player, event_data: EventData) -> Optional[types.Message]:
+    """Отправляет НОВОЕ сообщение с событием и статусом.
+       Возвращает отправленное сообщение или None в случае ошибки.
     """
     keyboard = build_event_keyboard(event_data)
-    
+
     # --- Формирование статус-блока --- 
     status_lines = [
         f"*Год:* {player.country.current_year}",
@@ -50,175 +51,432 @@ async def send_event_to_player(message_or_callback: types.Message | types.Callba
     description = event_data.description
     if event_data.character_name:
         description = f"**{event_data.character_name}:**\n{description}"
-        
+
     full_description = description + status_block # Добавляем статус
-        
+
     # TODO: Добавить отправку картинки event_data.image_url_prompt
-    
-    # Сохраняем текущее состояние И ID события в БД ПЕРЕД отправкой
-    player_state_to_save = PlayerState(
-        telegram_id=player.telegram_id,
-        country_state=CountryState.model_validate(player.country.get_state()),
-        current_event_id=event_data.id # Сохраняем ID
-    )
-    await save_player_state(player_state_to_save)
-    
+
+    sent_message = None
+    chat_id = None
+    bot = None
+    if isinstance(message_or_callback, types.Message):
+        chat_id = message_or_callback.chat.id
+        bot = message_or_callback.bot
+    elif isinstance(message_or_callback, types.CallbackQuery):
+        # Отвечаем на коллбек, чтобы убрать "часики"
+        await message_or_callback.answer()
+        if message_or_callback.message:
+            chat_id = message_or_callback.message.chat.id
+            bot = message_or_callback.bot
+
+    if chat_id and bot:
+        try:
+            # Всегда отправляем новое сообщение
+            sent_message = await bot.send_message(
+                chat_id=chat_id,
+                text=full_description,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            logging.info(f"Sent new event message {sent_message.message_id} to player {player.telegram_id}")
+        except Exception as e:
+            logging.exception(f"Unexpected error sending message for player {player.telegram_id}: {e}")
+    else:
+        logging.error(f"Could not determine chat_id or bot to send event to player {player.telegram_id}")
+
+    # НЕ СОХРАНЯЕМ состояние здесь
+    # НЕ ДОБАВЛЯЕМ ID сообщения здесь
+
+    return sent_message # Возвращаем объект сообщения
+
+# --- Вспомогательные функции для нарративных блоков --- 
+
+async def find_next_narrative_block(player_state: PlayerState, block_type: str) -> Optional[Dict[str, Any]]:
+    """Ищет следующий непросмотренный нарративный блок заданного типа."""
+    if not supabase:
+        return None
+
+    completed_ids = player_state.completed_narrative_block_ids
+    playthrough = player_state.playthrough_count
+
     try:
-        if isinstance(message_or_callback, types.Message):
-            # Отправляем с картинкой и полным описанием
-            sent_message = await message_or_callback.answer(full_description, reply_markup=keyboard, parse_mode="Markdown")
-            player.message_history.append(sent_message.message_id)
-        elif isinstance(message_or_callback, types.CallbackQuery):
-            await message_or_callback.answer()
-            # Редактируем с полным описанием
-            await message_or_callback.message.edit_text(full_description, reply_markup=keyboard, parse_mode="Markdown")
-    except TelegramBadRequest as e:
-        # Частая ошибка - попытка отредактировать сообщение без изменений
-        logging.warning(f"Failed to edit/send message for player {player.telegram_id}: {e}")
+        query = (
+            supabase.table("narrative_blocks")
+            .select("id", "text", "image_url", "button_text", "is_final_in_sequence")
+            .eq("block_type", block_type)
+            # Показываем, если required_playthrough = 0/NULL ИЛИ совпадает с текущим
+            .filter("required_playthrough", "in", f"(0,{playthrough})")
+            # Используем not_.in_ для исключения уже просмотренных
+            .not_.in_("id", completed_ids if completed_ids else [-1]) # -1 если список пуст
+            .order("sequence_order", desc=False) # Сортируем по порядку
+            .limit(1) # Берем первый не просмотренный
+        )
+        response = await query.execute()
+        return response.data[0] if response.data else None
     except Exception as e:
-        logging.exception(f"Unexpected error sending/editing message for player {player.telegram_id}: {e}")
+        logging.exception(f"Error finding next narrative block (type: {block_type}): {e}")
+        return None
+
+async def mark_narrative_block_completed(player_state: PlayerState, block_id: int):
+    """Добавляет ID блока в список просмотренных. НЕ СОХРАНЯЕТ состояние."""
+    if block_id not in player_state.completed_narrative_block_ids:
+        player_state.completed_narrative_block_ids.append(block_id)
+        # НЕ вызываем save_player_state здесь, сохранение будет при отправке сообщения
+
+async def start_game_proper(message_or_callback: types.Message | types.CallbackQuery, player: Player, player_state: PlayerState):
+    """Начинает основной игровой цикл: получает и отправляет первое игровое событие.
+       Предполагается, что старые сообщения УЖЕ удалены.
+    """
+    first_event_data = await get_next_event(player.country)
+
+    if first_event_data:
+        # Передаем обновленный player с правильными message_ids (которые должны быть пустыми)
+        sent_message = await send_event_to_player(message_or_callback, player, first_event_data)
+        if sent_message:
+            # Сохраняем состояние с ID ТОЛЬКО ЧТО отправленного сообщения
+            player_state.message_ids = [sent_message.message_id]
+            player_state.current_event_id = first_event_data.id
+            await save_player_state(player_state)
+        else:
+            logging.error(f"Failed to send initial event for player {player_state.telegram_id}")
+            # Пытаемся отправить сообщение об ошибке, если возможно
+            chat_id = message_or_callback.chat.id if isinstance(message_or_callback, types.Message) else message_or_callback.message.chat.id
+            bot = message_or_callback.bot if isinstance(message_or_callback, types.Message) else message_or_callback.bot
+            if chat_id and bot:
+                await bot.send_message(chat_id, "Не удалось начать игру. Ошибка при отправке события.")
+    else:
+        logging.warning(f"No initial game event found for player {player_state.telegram_id}.")
+        # Пытаемся отправить сообщение об ошибке
+        chat_id = message_or_callback.chat.id if isinstance(message_or_callback, types.Message) else message_or_callback.message.chat.id
+        bot = message_or_callback.bot if isinstance(message_or_callback, types.Message) else message_or_callback.bot
+        if chat_id and bot:
+            await bot.send_message(chat_id, "Не удалось начать игру. Нет доступных игровых событий.")
+
+# --- Обновленные обработчики --- 
 
 @router.message(CommandStart())
-async def handle_start(message: types.Message):
-    """Обработчик команды /start.
-       Загружает существующее состояние или создает новое.
-    """
+async def handle_start(message: types.Message, bot: Bot):
+    """Обработчик /start: Удаляет старые сообщения, загружает игрока и запускает нарративный блок или игру."""
     player_id = message.from_user.id
     logging.info(f"Player {player_id} interacting via /start.")
 
-    # Пытаемся загрузить состояние из БД
     loaded_state = await load_player_state(player_id)
+    player_state: PlayerState # Для аннотации типа
 
     if loaded_state:
-        logging.info(f"Found existing state for player {player_id}.")
-        # Создаем объект Player и загружаем состояние страны
-        player = Player(telegram_id=player_id)
-        player.load_country_state(loaded_state.country_state.model_dump()) # Загружаем данные страны
-        # TODO: Добавить логику удаления старых сообщений, если нужно
-        # player.message_history = [] # Очистить историю?
+        player_state = loaded_state
+        logging.info(f"Found existing state for player {player_id}, playthrough {player_state.playthrough_count}.")
+        
+        # --- Удаление старых сообщений --- 
+        await delete_player_messages(bot, player_id, player_state.message_ids)
+        player_state.message_ids = [] # Очищаем список в объекте
+        # Сохранять пустое состояние не обязательно сразу, оно сохранится при первом сообщении
+        # await save_player_state(player_state)
+        # ---------------------------------
+        
     else:
+        # Создаем Pydantic модель для нового игрока
+        player_state = PlayerState(
+            telegram_id=player_id,
+            country_state=CountryState() # Начальное состояние страны
+        )
         logging.info(f"Creating new state for player {player_id}.")
-        # Создаем нового игрока с начальным состоянием
-        player = Player(telegram_id=player_id)
-        # Начальное состояние УЖЕ установлено в __init__ Player/Country
-        # Но мы все равно должны его сохранить в БД в первый раз
-        # Это сделается при отправке первого события в send_event_to_player
+        # Первое сохранение произойдет при отправке первого блока/события
 
-    # Получаем первое событие из БД
-    current_event_data = await get_next_event(player.country)
+    # --- Создаем объект Player из PlayerState ---
+    player = Player(telegram_id=player_id)
+    player.load_country_state(player_state.country_state.model_dump())
+    player.playthrough_count = player_state.playthrough_count
+    player.completed_narrative_block_ids = player_state.completed_narrative_block_ids
+    player.message_ids = player_state.message_ids # Загружаем ID сообщений
+    # ------------------------------------------
 
-    if current_event_data:
-        await send_event_to_player(message, player, current_event_data)
+    # Ищем следующий блок вступления ('intro')
+    next_intro_block = await find_next_narrative_block(player_state, 'intro')
+
+    if next_intro_block:
+        # Показываем блок вступления
+        logging.info(f"Showing intro block {next_intro_block['id']} to player {player_id}")
+        builder = InlineKeyboardBuilder()
+        builder.button(text=next_intro_block['button_text'], callback_data=f"narrative_next_{next_intro_block['id']}")
+        
+        # TODO: Отправить картинку, если есть next_intro_block['image_url']
+        sent_block_message = await message.answer(next_intro_block['text'], reply_markup=builder.as_markup())
+        
+        # --- Сохраняем ID первого сообщения и состояние --- 
+        player_state.message_ids = [sent_block_message.message_id] # Обновляем модель для сохранения
+        # Сохраняем ИД блока, ИД сообщения и возможно новое состояние (если игрок новый)
+        await mark_narrative_block_completed(player_state, -1) # Вызываем для сохранения message_ids
+        # ---------------------------------------------------
+
     else:
-        await message.answer("Не удалось начать игру. Нет доступных событий.")
-        logging.warning(f"No initial/next event found for player {player_id}.")
+        # Вступление пройдено или не требуется, начинаем игру
+        logging.info(f"Intro sequence complete or not required for player {player_id}. Starting game proper.")
+        # Передаем созданный объект player
+        await start_game_proper(message, player, player_state)
 
+
+@router.callback_query(F.data.startswith("narrative_next_"))
+async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
+    """Обработчик нажатия кнопки 'Далее' в нарративных блоках."""
+    player_id = callback.from_user.id
+    chat_id = callback.message.chat.id # Получаем chat_id
+    try:
+        block_id = int(callback.data.split("_")[-1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка обработки кнопки.", show_alert=True)
+        return
+
+    logging.info(f"Player {player_id} pressed next on narrative block {block_id}")
+    loaded_state = await load_player_state(player_id)
+    if not loaded_state:
+        await callback.answer("Ошибка: Не найдено состояние игры. Начните заново /start", show_alert=True)
+        return
+
+    # --- Удаляем предыдущие сообщения --- 
+    if loaded_state.message_ids:
+        await delete_player_messages(bot, chat_id, loaded_state.message_ids)
+        loaded_state.message_ids = [] # Очищаем сразу
+    # ---------------------------------
+    await callback.answer() # Отвечаем на коллбек здесь, т.к. дальше не всегда будет вызван send_event_to_player
+
+    # Отмечаем ТЕКУЩИЙ блок как пройденный (но пока не сохраняем)
+    # Используем функцию, которая не сохраняет сама
+    await mark_narrative_block_completed(loaded_state, block_id)
+
+    # Загружаем данные текущего блока, чтобы узнать тип и финальность
+    current_block_data = None
+    if supabase:
+        try:
+            resp = await supabase.table("narrative_blocks").select("block_type, is_final_in_sequence").eq("id", block_id).limit(1).execute()
+            current_block_data = resp.data[0] if resp.data else None
+        except Exception as e:
+            logging.error(f"Failed to fetch current block data {block_id}: {e}")
+
+    if not current_block_data:
+         # await callback.answer("Ошибка: Не удалось получить данные блока.", show_alert=True) # Уже ответили
+         logging.error(f"Failed to get current block data {block_id} for player {player_id}")
+         # Возможно, стоит попытаться начать игру?
+         await bot.send_message(chat_id, "Произошла ошибка при загрузке данных повествования. Попробуйте /start")
+         return
+
+    # Убирать кнопку из предыдущего сообщения больше не нужно, т.к. оно удалено
+    # try:
+    #     await callback.message.edit_reply_markup(reply_markup=None)
+    # except TelegramBadRequest: pass
+
+    if current_block_data.get('is_final_in_sequence'):
+        # Это был последний блок в последовательности, начинаем игру
+        logging.info(f"Final narrative block {block_id} completed for player {player_id}. Starting game proper.")
+        # Создаем объект Player перед вызовом
+        player = Player(telegram_id=player_id)
+        player.load_country_state(loaded_state.country_state.model_dump())
+        player.playthrough_count = loaded_state.playthrough_count
+        player.completed_narrative_block_ids = loaded_state.completed_narrative_block_ids # Передаем обновленный список
+        player.message_ids = [] # Начинаем с пустыми ID
+        # Вызываем start_game_proper, которая отправит первое событие и сохранит состояние
+        await start_game_proper(callback, player, loaded_state) # Передаем callback, а не callback.message
+    else:
+        # Ищем следующий блок того же типа
+        next_block = await find_next_narrative_block(loaded_state, current_block_data['block_type'])
+        if next_block:
+            logging.info(f"Showing next narrative block {next_block['id']} to player {player_id}")
+            builder = InlineKeyboardBuilder()
+            builder.button(text=next_block['button_text'], callback_data=f"narrative_next_{next_block['id']}")
+            # TODO: Отправить картинку
+            # Отправляем как НОВОЕ сообщение
+            sent_block_message = await bot.send_message(
+                chat_id=chat_id,
+                text=next_block['text'],
+                reply_markup=builder.as_markup()
+            )
+
+            # --- Сохраняем ID нового сообщения и состояние --- 
+            if sent_block_message:
+                loaded_state.message_ids = [sent_block_message.message_id] # Обновляем ID в Pydantic модели
+                # completed_narrative_block_ids уже обновлен ранее вызовом mark_narrative_block_completed
+                await save_player_state(loaded_state) # Сохраняем состояние
+                logging.info(f"Saved state for player {player_id} with next narrative block {next_block['id']} and message {sent_block_message.message_id}")
+            else:
+                logging.error(f"Failed to send next narrative block message {next_block['id']} for player {player_id}")
+                # Состояние не сохранено с новым ID, но блок block_id отмечен пройденным в loaded_state
+        else:
+            # Не нашли следующий блок (хотя не должно быть, если не is_final) - начинаем игру
+            logging.warning(f"Could not find next narrative block after {block_id}, but not final. Starting game proper for player {player_id}.")
+            # Создаем объект Player перед вызовом
+            player = Player(telegram_id=player_id)
+            player.load_country_state(loaded_state.country_state.model_dump())
+            player.playthrough_count = loaded_state.playthrough_count
+            player.completed_narrative_block_ids = loaded_state.completed_narrative_block_ids # Передаем обновленный список
+            player.message_ids = [] # Начинаем с пустыми ID
+            # Вызываем start_game_proper
+            await start_game_proper(callback, player, loaded_state) # Передаем callback
+
+    # Отвечать на callback в конце больше не нужно
+    # await callback.answer()
+
+
+# --- Обработчик игровых событий (остается похожим, но нужны правки) --- 
 
 @router.callback_query(F.data.startswith("choice_"))
-async def handle_event_choice(callback: types.CallbackQuery):
-    """Обработчик нажатия на кнопку выбора варианта события.
-       Теперь с загрузкой/сохранением и применением эффектов!
-    """
+async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
+    """Обработчик нажатия на кнопку выбора варианта игрового события."""
     player_id = callback.from_user.id
-
-    # Загружаем ПОСЛЕДНЕЕ сохраненное состояние игрока из БД
+    chat_id = callback.message.chat.id # Получаем chat_id для удаления
     player_state_data = await load_player_state(player_id)
 
     if not player_state_data:
         await callback.answer("Ошибка: Не найдено состояние игры. Начните заново /start", show_alert=True)
-        logging.warning(f"Player state not found for {player_id} on callback.")
-        try:
-            await callback.message.edit_text("Игра не найдена. Пожалуйста, начните заново командой /start.", reply_markup=None)
-        except TelegramBadRequest:
-            pass # Ошибки редактирования здесь не критичны
         return
 
-    # --- Восстановление данных о событии и его вариантах --- 
+    # --- Удаляем предыдущие сообщения --- 
+    if player_state_data.message_ids:
+        await delete_player_messages(bot, chat_id, player_state_data.message_ids)
+        player_state_data.message_ids = [] # Очищаем сразу в Pydantic модели
+    # ---------------------------------
+
     event_id = player_state_data.current_event_id
     if not event_id:
-        # Случай, когда у игрока не было активного события (ошибка?) 
-        await callback.answer("Ошибка: Не найдено активное событие. Попробуйте /start", show_alert=True)
-        logging.error(f"Player {player_id} has no current_event_id in loaded state.")
+        await callback.answer("Ошибка: Нет активного события. Возможно, стоит начать заново /start", show_alert=True)
+        logging.warning(f"No current_event_id found for player {player_id} on choice callback.")
         return
-    
-    # Загружаем варианты для этого события (эффекты нужны здесь)
+
+    # Загружаем варианты для события
+    from game.events import fetch_event_options
     options_data = await fetch_event_options(event_id)
     if not options_data:
-         await callback.answer("Ошибка: Не удалось загрузить варианты для события. Попробуйте /start", show_alert=True)
-         logging.error(f"Could not fetch options for event_id {event_id} for player {player_id}")
+         await callback.answer("Ошибка: Не удалось загрузить варианты для события.", show_alert=True)
+         logging.error(f"Failed to fetch event options for event {event_id}")
          return
-    # --- Конец восстановления --- 
 
-    # Извлекаем индекс выбора
     try:
         choice_index = int(callback.data.split("_")[1])
         if not 0 <= choice_index < len(options_data):
             raise IndexError("Choice index out of range")
     except (IndexError, ValueError):
-        await callback.answer("Ошибка обработки выбора.", show_alert=True)
-        logging.error(f"Invalid callback data format: {callback.data}")
+        await callback.answer("Ошибка: Неверный формат кнопки.", show_alert=True)
+        logging.error(f"Invalid callback data format for player {player_id}: {callback.data}")
         return
 
-    # Получаем данные выбранного варианта
     chosen_option = options_data[choice_index]
     effects = chosen_option.get('effects', {})
-    outcome_text = chosen_option.get('outcome_text')
-    # image_url_result = chosen_option.get('image_url_result') # TODO: Использовать для показа результата
-    # next_event_name = chosen_option.get('next_event_name') # TODO: Использовать для цепочек событий
+    # outcome_text = chosen_option.get('outcome_text') # TODO
+    # next_event_name = chosen_option.get('next_event_name') # TODO
 
-    # Создаем объект Player и загружаем состояние
+    # --- Обновляем объект Player --- 
     player = Player(telegram_id=player_id)
     player.load_country_state(player_state_data.country_state.model_dump())
-    
+    player.playthrough_count = player_state_data.playthrough_count
+    player.completed_narrative_block_ids = player_state_data.completed_narrative_block_ids
+    player.message_ids = [] # Начинаем с пустого списка ID для этого хода
+    # -----------------------------
+
     # --- Применяем эффекты! --- 
     player.country.update(effects)
-    player.country.current_year += 1 # Увеличиваем год после эффектов
+    player.country.current_year += 1
     logging.info(f"Player {player_id} chose option {choice_index} for event {event_id}. Year: {player.country.current_year}")
     logging.info(f"New state for player {player_id}: {player.country.get_state()}")
 
-    # TODO: Показать outcome_text и image_url_result перед следующим событием? 
-    # await callback.message.answer(f"Результат: {outcome_text}") # Например
+    # --- Подготовка состояния для сохранения (промежуточного или финального) --- 
+    state_to_save = PlayerState(
+        telegram_id=player.telegram_id,
+        country_state=CountryState.model_validate(player.country.get_state()),
+        playthrough_count=player.playthrough_count,
+        completed_narrative_block_ids=player.completed_narrative_block_ids,
+        message_ids=[], # Сохраняем пустой список ID перед отправкой нового сообщения
+        current_event_id=None # Сбрасываем ID перед поиском нового
+    )
+    # ------------------------------------------------------------------------
 
     # Проверяем условия конца игры
     game_over_reason = check_game_over_conditions(player.country)
     if game_over_reason:
         logging.info(f"Game over for player {player_id}. Reason: {game_over_reason}")
-        # TODO: Реализовать логику удаления сообщений (пока просто редактируем)
-        # await delete_player_messages(callback.bot, player_id, player.message_history)
-        # Удалять ли запись из БД? Пока оставим.
-        # await delete_player_state(player_id)
-        try:
-            await callback.message.edit_text(f"Игра окончена! {game_over_reason}\nНачать заново? /start", reply_markup=None)
-        except TelegramBadRequest:
-             pass # Может быть ошибка, если сообщение уже удалено
-        await callback.answer() # Отвечаем на callback
+
+        # --- Обновляем состояние для начала новой игры --- 
+        new_playthrough_count = state_to_save.playthrough_count + 1
+        new_country = Country()
+        state_to_save.country_state = CountryState.model_validate(new_country.get_state())
+        state_to_save.playthrough_count = new_playthrough_count
+        state_to_save.completed_narrative_block_ids = []
+        state_to_save.message_ids = [] # ID сообщений остаются пустыми
+        # --------------------------------------------------
+
+        await save_player_state(state_to_save) # Сохраняем состояние для СЛЕДУЮЩЕЙ игры
+        logging.info(f"Player {player_id} state reset for new playthrough {new_playthrough_count}.")
+
+        # Отправляем сообщение о конце игры (это будет единственное сообщение)
+        game_over_message = await bot.send_message(
+            chat_id=chat_id,
+            text=f"Игра окончена! {game_over_reason}\n\nНачать новое правление (прохождение #{new_playthrough_count})? /start",
+            reply_markup=None
+        )
+        # Сохраняем ID сообщения о конце игры, чтобы при следующем /start оно удалилось
+        if game_over_message:
+            state_to_save.message_ids = [game_over_message.message_id]
+            await save_player_state(state_to_save)
+
+        await callback.answer() # Отвечаем на коллбек
         return
 
-    # Если игра не окончена, получаем следующее событие из БД
-    # TODO: Учесть next_event_name, если он есть
+    # --- Если игра НЕ окончена --- 
+    # НЕ сохраняем промежуточное состояние здесь, сохраним ПОСЛЕ отправки нового события
+
+    # TODO: Показать outcome_text? (Можно отправить отдельным сообщением, которое не удалится?)
+
+    # Получаем следующее ИГРОВОЕ событие
+    # TODO: Учесть next_event_name?
     next_event_data = await get_next_event(player.country)
 
     if next_event_data:
-        # Отправляем новое событие и СОХРАНЯЕМ состояние
-        await send_event_to_player(callback, player, next_event_data)
+        # Отправляем новое сообщение через обновленную функцию
+        sent_message = await send_event_to_player(callback, player, next_event_data)
+        if sent_message:
+            # Сохраняем состояние с ID нового события И ID нового сообщения
+            state_to_save.message_ids = [sent_message.message_id]
+            state_to_save.current_event_id = next_event_data.id
+            await save_player_state(state_to_save)
+            logging.info(f"Saved state for player {player_id} with new event {next_event_data.id} and message {sent_message.message_id}")
+        else:
+            logging.error(f"Failed to send next event message for player {player_id}")
+            await callback.answer("Ошибка при отправке следующего события.", show_alert=True)
     else:
-        # Ситуация, когда событий больше нет
-        logging.warning(f"No next event found for player {player_id} after year {player.country.current_year}.")
-        try:
-             await callback.message.edit_text("Странно, но событий больше нет... Возможно, вы достигли конца? Начните заново? /start", reply_markup=None)
-        except TelegramBadRequest:
-             pass
-        await callback.answer()
-        # Может быть, стоит удалить состояние игрока?
-        # await delete_player_state(player_id)
+        # Если следующих событий нет - Game Over?
+        logging.warning(f"No next event found for player {player_id} after event {event_id}.")
+        # TODO: Что делать в этом случае? Пока просто отвечаем.
+        await callback.answer("Не найдено следующее событие.", show_alert=True)
+        # Возможно, стоит отправить сообщение об окончании и сохранить состояние?
+        await bot.send_message(chat_id, "Похоже, история вашего правления подошла к концу.")
+        # Сохраним последнее состояние без current_event_id и без message_ids
+        state_to_save.current_event_id = None
+        state_to_save.message_ids = []
+        await save_player_state(state_to_save)
 
-# Важное TODO:
-# - Реализовать удаление сообщений при game over или /start.
-# - Улучшить механизм восстановления события (если __init__ потребует аргументов).
-# - Рассмотреть удаление записи из БД при game over.
+    # Отвечать на callback уже не нужно, т.к. send_event_to_player это делает
+    # await callback.answer()
 
-# Дополнительное TODO: 
-# - Реализовать отправку/редактирование с картинками (image_url_prompt/image_url_result).
+# TODO: 
+# - Логика инкремента playthrough_count и сброса completed_narrative_block_ids при game over.
+# - Реализовать показ character_intro перед событиями персонажей.
+# - Реализовать отправку картинок.
 # - Реализовать показ outcome_text.
-# - Учесть next_event_name для цепочек событий в get_next_event или здесь.
-# - Добавить обработку истории событий (is_unique, избегание повторов).
+# - Добавить обработку next_event_name.
+# - Улучшить get_next_event (is_unique, max_year).
+# - Удаление сообщений.
+
+# --- Вспомогательная функция для удаления --- 
+
+async def delete_player_messages(bot: Bot, chat_id: int, message_ids: List[int]):
+    """Пытается удалить список сообщений для игрока."""
+    logging.info(f"Attempting to delete {len(message_ids)} messages for chat {chat_id}")
+    deleted_count = 0
+    for msg_id in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            deleted_count += 1
+        except TelegramBadRequest as e:
+            # Частая ошибка: сообщение уже удалено или не найдено
+            logging.warning(f"Failed to delete message {msg_id} for chat {chat_id}: {e}")
+        except Exception as e:
+            logging.exception(f"Unexpected error deleting message {msg_id} for chat {chat_id}: {e}")
+    logging.info(f"Deleted {deleted_count}/{len(message_ids)} messages for chat {chat_id}")

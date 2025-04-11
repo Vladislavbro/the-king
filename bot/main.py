@@ -21,8 +21,9 @@ async def main():
     bot = Bot(token=config.TELEGRAM_TOKEN)
     dp = Dispatcher()
 
-    # Подключение роутера с обработчиками
+    # Передаем объект bot в роутер, чтобы он был доступен в хендлерах
     dp.include_router(main_router)
+    dp["bot"] = bot # Стандартный способ передать bot в хендлеры через Dispatcher
 
     # Запуск polling
     logging.info("Starting bot...")

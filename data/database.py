@@ -45,10 +45,11 @@ async def load_player_state(telegram_id: int) -> Optional[PlayerState]:
         return None
 
     try:
-        # Загружаем обновленный набор колонок
+        # Загружаем все колонки игрока
         query = (
             supabase.table("players")
-            .select("telegram_id", "state", "current_event_id")
+            # Добавляем message_ids в select
+            .select("telegram_id", "state", "current_event_id", "playthrough_count", "completed_narrative_block_ids", "message_ids") 
             .eq("telegram_id", telegram_id)
             .limit(1)
         )
@@ -64,11 +65,15 @@ async def load_player_state(telegram_id: int) -> Optional[PlayerState]:
         full_player_data = {
             "telegram_id": player_data_raw.get("telegram_id"),
             "country_state": player_data_raw.get("state"),
-            "current_event_id": player_data_raw.get("current_event_id")
+            "current_event_id": player_data_raw.get("current_event_id"),
+            # Загружаем новые поля
+            "playthrough_count": player_data_raw.get("playthrough_count", 1),
+            "completed_narrative_block_ids": player_data_raw.get("completed_narrative_block_ids", []),
+            "message_ids": player_data_raw.get("message_ids", []) # Загружаем message_ids
         }
         try:
             player_state = PlayerState.model_validate(full_player_data)
-            logging.info(f"Loaded state for player {telegram_id} (event_id: {player_state.current_event_id}).")
+            logging.info(f"Loaded state for player {telegram_id} (Playthrough: {player_state.playthrough_count}, EventID: {player_state.current_event_id}, Msgs: {len(player_state.message_ids)}).")
             return player_state
         except ValidationError as e:
             logging.error(f"Data validation error for player {telegram_id}: {e}")
@@ -95,11 +100,15 @@ async def save_player_state(player_state: PlayerState) -> bool:
         return False
 
     try:
-        # Сохраняем обновленный набор полей
+        # Сохраняем все актуальные поля
         data_to_upsert = {
             "telegram_id": player_state.telegram_id,
             "state": player_state.country_state.model_dump(),
-            "current_event_id": player_state.current_event_id
+            "current_event_id": player_state.current_event_id,
+            "playthrough_count": player_state.playthrough_count,
+            # Преобразуем список Python в формат массива PostgreSQL для сохранения
+            "completed_narrative_block_ids": player_state.completed_narrative_block_ids,
+            "message_ids": player_state.message_ids # Сохраняем message_ids
         }
         
         query = (
@@ -111,7 +120,7 @@ async def save_player_state(player_state: PlayerState) -> bool:
 
         # Проверяем успешность операции (хотя upsert обычно не возвращает ошибку, если PK есть)
         if response.data or (hasattr(response, 'error') and response.error is None):
-            logging.info(f"Successfully saved state for player {player_state.telegram_id} (event_id: {player_state.current_event_id}).")
+            logging.info(f"Successfully saved state for player {player_state.telegram_id} (Playthrough: {player_state.playthrough_count}, EventID: {player_state.current_event_id}, Msgs: {len(player_state.message_ids)}).")
             return True
         else:
             logging.error(f"Failed to save player state for {player_state.telegram_id}. Response: {response}")
