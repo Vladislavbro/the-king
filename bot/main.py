@@ -6,24 +6,32 @@ from aiogram.filters import CommandStart
 
 import config
 from bot.handlers import router as main_router # Импортируем роутер из handlers.py
-from data.database import init_supabase_client # Импортируем функцию инициализации БД
+from data.database import init_supabase_client # Импортируем только функцию инициализации
 
 async def main():
     """Основная функция для запуска бота."""
-    # Настройка логирования (базовая)
-    logging.basicConfig(level=logging.INFO)
+    # Настройка логирования (изменено на INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 
     # --- Инициализация клиента Supabase --- 
-    await init_supabase_client()
+    db_client = await init_supabase_client()
+    if not db_client:
+        logging.critical("Failed to initialize Supabase client. Bot cannot start.")
+        return # Не запускаем бота, если нет подключения к БД
     # --------------------------------------
 
     # Создание объектов бота и диспетчера
     bot = Bot(token=config.TELEGRAM_TOKEN)
     dp = Dispatcher()
 
-    # Передаем объект bot в роутер, чтобы он был доступен в хендлерах
+    # --- Передаем клиент Supabase в контекст --- 
+    # Это стандартный способ aiogram передавать данные в хендлеры
+    dp["db_client"] = db_client
+    # Передаем и объект bot, если он нужен в хендлерах не через аргумент
+    # dp["bot"] = bot # <- Кажется, это было сделано ранее, проверим, нужно ли
+
+    # Подключаем роутер
     dp.include_router(main_router)
-    dp["bot"] = bot # Стандартный способ передать bot в хендлеры через Dispatcher
 
     # Запуск polling
     logging.info("Starting bot...")

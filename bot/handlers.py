@@ -8,11 +8,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
 from game.core import Player, Country # Импортируем Country для создания нового состояния
-from game.events import get_next_event, EventData, fetch_event_options # Импортируем EventData и fetch_event_options
+from game.events import EventData, get_next_event, fetch_event_options # ИМПОРТИРУЕМ обновленные функции из game.events
 from game.mechanics import check_game_over_conditions
-from data.database import supabase, load_player_state, save_player_state
+from data.database import load_player_state, save_player_state
 from data.models import PlayerState, CountryState # Импортируем Pydantic модели
 import config
+
+# Добавляем AsyncClient для type hinting
+from supabase._async.client import AsyncClient 
 
 # Используем Router для лучшей организации
 router = Router()
@@ -91,30 +94,36 @@ async def send_event_to_player(message_or_callback: types.Message | types.Callba
 
 # --- Вспомогательные функции для нарративных блоков --- 
 
-async def find_next_narrative_block(player_state: PlayerState, block_type: str) -> Optional[Dict[str, Any]]:
-    """Ищет следующий непросмотренный нарративный блок заданного типа."""
-    if not supabase:
+async def find_next_narrative_block(db_client: AsyncClient, playthrough: int, completed_ids: list[int]) -> Optional[dict]:
+    """Находит следующий доступный нарративный блок."""
+    # logging.debug(f"[find_next_narrative_block] Using db_client: {db_client}")
+    if not db_client:
+        logging.error("Invalid db_client provided to find_next_narrative_block.")
         return None
 
-    completed_ids = player_state.completed_narrative_block_ids
-    playthrough = player_state.playthrough_count
-
     try:
+        # logging.debug(f"[find_next_narrative_block] Executing query...")
         query = (
-            supabase.table("narrative_blocks")
+            db_client.table("narrative_blocks")
             .select("id", "text", "image_url", "button_text", "is_final_in_sequence")
             .eq("block_type", block_type)
-            # Показываем, если required_playthrough = 0/NULL ИЛИ совпадает с текущим
-            .filter("required_playthrough", "in", f"(0,{playthrough})")
+            .or_(f"required_playthrough.eq.0,required_playthrough.is.null,required_playthrough.eq.{playthrough}")
             # Используем not_.in_ для исключения уже просмотренных
             .not_.in_("id", completed_ids if completed_ids else [-1]) # -1 если список пуст
             .order("sequence_order", desc=False) # Сортируем по порядку
             .limit(1) # Берем первый не просмотренный
         )
         response = await query.execute()
-        return response.data[0] if response.data else None
+        # logging.debug(f"[find_next_narrative_block] Query response object: {response}")
+
+        if response.data:
+            # logging.debug(f"Narrative block query for playthrough {playthrough}, completed {completed_ids}: Response data: {response.data}")
+            return response.data[0]
+        else:
+            logging.info(f"No narrative blocks found for playthrough {playthrough} excluding IDs {completed_ids}")
     except Exception as e:
-        logging.exception(f"Error finding next narrative block (type: {block_type}): {e}")
+        # Убедимся, что исключение логируется
+        logging.exception(f"[find_next_narrative_block] EXCEPTION during query execution or processing for type '{block_type}': {e}")
         return None
 
 async def mark_narrative_block_completed(player_state: PlayerState, block_id: int):
@@ -123,20 +132,17 @@ async def mark_narrative_block_completed(player_state: PlayerState, block_id: in
         player_state.completed_narrative_block_ids.append(block_id)
         # НЕ вызываем save_player_state здесь, сохранение будет при отправке сообщения
 
-async def start_game_proper(message_or_callback: types.Message | types.CallbackQuery, player: Player, player_state: PlayerState):
-    """Начинает основной игровой цикл: получает и отправляет первое игровое событие.
-       Предполагается, что старые сообщения УЖЕ удалены.
-    """
-    first_event_data = await get_next_event(player.country)
+async def start_game_proper(db_client: AsyncClient, message_or_callback: types.Message | types.CallbackQuery, player: Player, player_state: PlayerState):
+    """Начинает основной игровой цикл, используя db_client."""
+    # Используем импортированную функцию get_next_event
+    first_event_data = await get_next_event(db_client, player.country) 
 
     if first_event_data:
-        # Передаем обновленный player с правильными message_ids (которые должны быть пустыми)
         sent_message = await send_event_to_player(message_or_callback, player, first_event_data)
         if sent_message:
-            # Сохраняем состояние с ID ТОЛЬКО ЧТО отправленного сообщения
             player_state.message_ids = [sent_message.message_id]
             player_state.current_event_id = first_event_data.id
-            await save_player_state(player_state)
+            await save_player_state(db_client, player_state)
         else:
             logging.error(f"Failed to send initial event for player {player_state.telegram_id}")
             # Пытаемся отправить сообщение об ошибке, если возможно
@@ -155,12 +161,13 @@ async def start_game_proper(message_or_callback: types.Message | types.CallbackQ
 # --- Обновленные обработчики --- 
 
 @router.message(CommandStart())
-async def handle_start(message: types.Message, bot: Bot):
+async def handle_start(message: types.Message, bot: Bot, db_client: AsyncClient):
     """Обработчик /start: Удаляет старые сообщения, загружает игрока и запускает нарративный блок или игру."""
     player_id = message.from_user.id
     logging.info(f"Player {player_id} interacting via /start.")
 
-    loaded_state = await load_player_state(player_id)
+    # Передаем db_client в load_player_state
+    loaded_state = await load_player_state(db_client, player_id) 
     player_state: PlayerState # Для аннотации типа
 
     if loaded_state:
@@ -192,7 +199,7 @@ async def handle_start(message: types.Message, bot: Bot):
     # ------------------------------------------
 
     # Ищем следующий блок вступления ('intro')
-    next_intro_block = await find_next_narrative_block(player_state, 'intro')
+    next_intro_block = await find_next_narrative_block(db_client, player_state, 'intro')
 
     if next_intro_block:
         # Показываем блок вступления
@@ -203,21 +210,27 @@ async def handle_start(message: types.Message, bot: Bot):
         # TODO: Отправить картинку, если есть next_intro_block['image_url']
         sent_block_message = await message.answer(next_intro_block['text'], reply_markup=builder.as_markup())
         
-        # --- Сохраняем ID первого сообщения и состояние --- 
-        player_state.message_ids = [sent_block_message.message_id] # Обновляем модель для сохранения
-        # Сохраняем ИД блока, ИД сообщения и возможно новое состояние (если игрок новый)
-        await mark_narrative_block_completed(player_state, -1) # Вызываем для сохранения message_ids
-        # ---------------------------------------------------
+        # --- Сохраняем ID сообщения и отмечаем блок как пройденный --- 
+        if sent_block_message:
+            player_state.message_ids = [sent_block_message.message_id] # Обновляем модель для сохранения
+            # Отмечаем ИМЕННО ЭТОТ блок как пройденный (добавит ID в список)
+            await mark_narrative_block_completed(player_state, next_intro_block['id'])
+            # Сохраняем состояние с ID сообщения И обновленным списком пройденных блоков
+            await save_player_state(db_client, player_state)
+            logging.info(f"Saved initial state for player {player_id} with intro block {next_intro_block['id']} and message {sent_block_message.message_id}")
+        else:
+             logging.error(f"Failed to send intro block message {next_intro_block['id']} for player {player_id}")
+             # Если не удалось отправить, состояние не сохраняем, чтобы блок не считался пройденным
 
     else:
         # Вступление пройдено или не требуется, начинаем игру
         logging.info(f"Intro sequence complete or not required for player {player_id}. Starting game proper.")
-        # Передаем созданный объект player
-        await start_game_proper(message, player, player_state)
+        # Передаем db_client в start_game_proper
+        await start_game_proper(db_client, message, player, player_state)
 
 
 @router.callback_query(F.data.startswith("narrative_next_"))
-async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
+async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot, db_client: AsyncClient):
     """Обработчик нажатия кнопки 'Далее' в нарративных блоках."""
     player_id = callback.from_user.id
     chat_id = callback.message.chat.id # Получаем chat_id
@@ -228,7 +241,7 @@ async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
         return
 
     logging.info(f"Player {player_id} pressed next on narrative block {block_id}")
-    loaded_state = await load_player_state(player_id)
+    loaded_state = await load_player_state(db_client, player_id)
     if not loaded_state:
         await callback.answer("Ошибка: Не найдено состояние игры. Начните заново /start", show_alert=True)
         return
@@ -246,9 +259,9 @@ async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
 
     # Загружаем данные текущего блока, чтобы узнать тип и финальность
     current_block_data = None
-    if supabase:
+    if db_client:
         try:
-            resp = await supabase.table("narrative_blocks").select("block_type, is_final_in_sequence").eq("id", block_id).limit(1).execute()
+            resp = await db_client.table("narrative_blocks").select("block_type, is_final_in_sequence").eq("id", block_id).limit(1).execute()
             current_block_data = resp.data[0] if resp.data else None
         except Exception as e:
             logging.error(f"Failed to fetch current block data {block_id}: {e}")
@@ -274,11 +287,11 @@ async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
         player.playthrough_count = loaded_state.playthrough_count
         player.completed_narrative_block_ids = loaded_state.completed_narrative_block_ids # Передаем обновленный список
         player.message_ids = [] # Начинаем с пустыми ID
-        # Вызываем start_game_proper, которая отправит первое событие и сохранит состояние
-        await start_game_proper(callback, player, loaded_state) # Передаем callback, а не callback.message
+        # Передаем db_client
+        await start_game_proper(db_client, callback, player, loaded_state) # Передаем callback, а не callback.message
     else:
         # Ищем следующий блок того же типа
-        next_block = await find_next_narrative_block(loaded_state, current_block_data['block_type'])
+        next_block = await find_next_narrative_block(db_client, loaded_state, current_block_data['block_type'])
         if next_block:
             logging.info(f"Showing next narrative block {next_block['id']} to player {player_id}")
             builder = InlineKeyboardBuilder()
@@ -295,7 +308,7 @@ async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
             if sent_block_message:
                 loaded_state.message_ids = [sent_block_message.message_id] # Обновляем ID в Pydantic модели
                 # completed_narrative_block_ids уже обновлен ранее вызовом mark_narrative_block_completed
-                await save_player_state(loaded_state) # Сохраняем состояние
+                await save_player_state(db_client, loaded_state) # Сохраняем состояние
                 logging.info(f"Saved state for player {player_id} with next narrative block {next_block['id']} and message {sent_block_message.message_id}")
             else:
                 logging.error(f"Failed to send next narrative block message {next_block['id']} for player {player_id}")
@@ -309,8 +322,8 @@ async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
             player.playthrough_count = loaded_state.playthrough_count
             player.completed_narrative_block_ids = loaded_state.completed_narrative_block_ids # Передаем обновленный список
             player.message_ids = [] # Начинаем с пустыми ID
-            # Вызываем start_game_proper
-            await start_game_proper(callback, player, loaded_state) # Передаем callback
+            # Передаем db_client
+            await start_game_proper(db_client, callback, player, loaded_state) # Передаем callback
 
     # Отвечать на callback в конце больше не нужно
     # await callback.answer()
@@ -319,11 +332,11 @@ async def handle_narrative_next(callback: types.CallbackQuery, bot: Bot):
 # --- Обработчик игровых событий (остается похожим, но нужны правки) --- 
 
 @router.callback_query(F.data.startswith("choice_"))
-async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
+async def handle_event_choice(callback: types.CallbackQuery, bot: Bot, db_client: AsyncClient):
     """Обработчик нажатия на кнопку выбора варианта игрового события."""
     player_id = callback.from_user.id
     chat_id = callback.message.chat.id # Получаем chat_id для удаления
-    player_state_data = await load_player_state(player_id)
+    player_state_data = await load_player_state(db_client, player_id)
 
     if not player_state_data:
         await callback.answer("Ошибка: Не найдено состояние игры. Начните заново /start", show_alert=True)
@@ -341,9 +354,8 @@ async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
         logging.warning(f"No current_event_id found for player {player_id} on choice callback.")
         return
 
-    # Загружаем варианты для события
-    from game.events import fetch_event_options
-    options_data = await fetch_event_options(event_id)
+    # Используем импортированную функцию fetch_event_options
+    options_data = await fetch_event_options(db_client, event_id) 
     if not options_data:
          await callback.answer("Ошибка: Не удалось загрузить варианты для события.", show_alert=True)
          logging.error(f"Failed to fetch event options for event {event_id}")
@@ -402,7 +414,7 @@ async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
         state_to_save.message_ids = [] # ID сообщений остаются пустыми
         # --------------------------------------------------
 
-        await save_player_state(state_to_save) # Сохраняем состояние для СЛЕДУЮЩЕЙ игры
+        await save_player_state(db_client, state_to_save) # Сохраняем состояние для СЛЕДУЮЩЕЙ игры
         logging.info(f"Player {player_id} state reset for new playthrough {new_playthrough_count}.")
 
         # Отправляем сообщение о конце игры (это будет единственное сообщение)
@@ -414,7 +426,7 @@ async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
         # Сохраняем ID сообщения о конце игры, чтобы при следующем /start оно удалилось
         if game_over_message:
             state_to_save.message_ids = [game_over_message.message_id]
-            await save_player_state(state_to_save)
+            await save_player_state(db_client, state_to_save)
 
         await callback.answer() # Отвечаем на коллбек
         return
@@ -424,9 +436,8 @@ async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
 
     # TODO: Показать outcome_text? (Можно отправить отдельным сообщением, которое не удалится?)
 
-    # Получаем следующее ИГРОВОЕ событие
-    # TODO: Учесть next_event_name?
-    next_event_data = await get_next_event(player.country)
+    # Используем импортированную функцию get_next_event
+    next_event_data = await get_next_event(db_client, player.country) 
 
     if next_event_data:
         # Отправляем новое сообщение через обновленную функцию
@@ -435,7 +446,7 @@ async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
             # Сохраняем состояние с ID нового события И ID нового сообщения
             state_to_save.message_ids = [sent_message.message_id]
             state_to_save.current_event_id = next_event_data.id
-            await save_player_state(state_to_save)
+            await save_player_state(db_client, state_to_save)
             logging.info(f"Saved state for player {player_id} with new event {next_event_data.id} and message {sent_message.message_id}")
         else:
             logging.error(f"Failed to send next event message for player {player_id}")
@@ -450,7 +461,7 @@ async def handle_event_choice(callback: types.CallbackQuery, bot: Bot):
         # Сохраним последнее состояние без current_event_id и без message_ids
         state_to_save.current_event_id = None
         state_to_save.message_ids = []
-        await save_player_state(state_to_save)
+        await save_player_state(db_client, state_to_save)
 
     # Отвечать на callback уже не нужно, т.к. send_event_to_player это делает
     # await callback.answer()

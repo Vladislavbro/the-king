@@ -8,11 +8,11 @@ class CountryState(BaseModel):
     """Pydantic модель для валидации и структурирования данных состояния страны.
        Используется для сохранения и загрузки из БД.
     """
-    support: int = Field(..., ge=0) # Поддержка не может быть отрицательной (хотя <=0 - конец игры)
-    treasury: int
-    army: StatusLevel
-    peasants: StatusLevel
-    current_year: int = Field(..., gt=0) # Год должен быть положительным
+    support: int = Field(50, ge=0) # Начальная поддержка
+    treasury: int = 1000 # Начальная казна
+    army: StatusLevel = "medium" # Начальный статус армии
+    peasants: StatusLevel = "medium" # Начальный статус крестьян
+    current_year: int = Field(1, gt=0) # Начинаем с 1-го года
 
     class Config:
         # Позволяет использовать модель как со словарями, так и с атрибутами объекта

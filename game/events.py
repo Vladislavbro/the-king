@@ -3,6 +3,9 @@ from typing import List, Dict, Any, Optional, Tuple
 import random
 import json # Для работы с JSONB из БД
 
+# Импортируем AsyncClient для type hinting
+from supabase._async.client import AsyncClient
+
 from game.core import Country # Нужен для проверки условий
 
 # --- Классы событий и AVAILABLE_EVENTS теперь не нужны --- 
@@ -29,15 +32,18 @@ class EventData:
             for opt in sorted(self.options, key=lambda x: x.get('display_order', 0))
         ]
 
-async def fetch_event_options(event_id: int) -> List[Dict[str, Any]]:
+# Функция теперь принимает db_client
+async def fetch_event_options(db_client: AsyncClient, event_id: int) -> List[Dict[str, Any]]:
     """Загружает варианты ответов для заданного ID события."""
-    from data.database import supabase
-    if not supabase:
-        logging.error("Supabase client not initialized. Cannot fetch event options.")
+    # Убираем импорт и проверку глобальной supabase
+    # from data.database import supabase
+    if not db_client:
+        logging.error("Invalid db_client provided to fetch_event_options.")
         return []
     try:
+        # Используем db_client
         query = (
-            supabase.table("event_options")
+            db_client.table("event_options")
             .select("id", "button_text", "effects", "outcome_text", "image_url_result", "next_event_name", "display_order")
             .eq("event_id", event_id)
             .order("display_order") # Запрашиваем сортировку сразу
@@ -76,7 +82,8 @@ def check_trigger_conditions(conditions: Optional[Dict[str, Any]], country: Coun
             
     return True # Все условия выполнены
 
-async def get_next_event(country: Country) -> Optional[EventData]:
+# Функция теперь принимает db_client
+async def get_next_event(db_client: AsyncClient, country: Country) -> Optional[EventData]:
     """Выбирает и возвращает следующее событие из базы данных.
 
     Логика выбора (упрощенная):
@@ -85,16 +92,17 @@ async def get_next_event(country: Country) -> Optional[EventData]:
     3. Выбирает одно случайным образом с учетом веса.
     4. Загружает варианты ответов для выбранного события.
     """
-    from data.database import supabase
-    if not supabase:
-        logging.error("Supabase client not initialized. Cannot get next event.")
+    # Убираем импорт и проверку глобальной supabase
+    # from data.database import supabase
+    if not db_client:
+        logging.error("Invalid db_client provided to get_next_event.")
         return None
 
     possible_events = []
     try:
-        # --- Шаг 1: Проверка условных событий --- 
+        # Используем db_client
         query_conditional = (
-            supabase.table("events")
+            db_client.table("events")
             .select("id", "name", "description", "image_url_prompt", "character_name", "trigger_conditions", "frequency_weight")
             .eq("event_type", "conditional")
             .lte("min_year", country.current_year)
@@ -108,10 +116,10 @@ async def get_next_event(country: Country) -> Optional[EventData]:
                 if check_trigger_conditions(conditions, country):
                     possible_events.append(event_row)
         
-        # --- Шаг 2: Если нет условных, ищем случайные/персонажные --- 
         if not possible_events:
+            # Используем db_client
             query_random = (
-                supabase.table("events")
+                db_client.table("events")
                 .select("id", "name", "description", "image_url_prompt", "character_name", "trigger_conditions", "frequency_weight")
                 .in_("event_type", ["random", "character"]) # Ищем случайные и персонажные
                 .lte("min_year", country.current_year)
@@ -121,7 +129,6 @@ async def get_next_event(country: Country) -> Optional[EventData]:
             if response_random.data:
                 possible_events.extend(response_random.data)
 
-        # --- Шаг 3: Выбор события --- 
         if not possible_events:
             logging.warning(f"No suitable events found for player state: {country.get_state()}")
             return None # Или вернуть стандартное "ничего не происходит" событие?
@@ -132,11 +139,13 @@ async def get_next_event(country: Country) -> Optional[EventData]:
 
         # --- Шаг 4: Загрузка вариантов --- 
         event_id = chosen_event_row['id']
-        options = await fetch_event_options(event_id)
+        # Передаем db_client в fetch_event_options
+        options = await fetch_event_options(db_client, event_id)
 
         if not options:
             logging.error(f"No options found for chosen event_id {event_id}! Skipping event.")
-            return await get_next_event(country) # Рекурсивная попытка найти другое событие
+            # Передаем db_client при рекурсивном вызове
+            return await get_next_event(db_client, country) # Рекурсивная попытка найти другое событие
 
         logging.info(f"Selected event: ID={event_id}, Name={chosen_event_row.get('name')}")
         return EventData(chosen_event_row, options)
